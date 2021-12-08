@@ -35,6 +35,8 @@ func handleCoAP(w mux.ResponseWriter, req *mux.Message) {
 		}
 
 		log.Info().Msgf("received payload: %s", hex)
+	} else {
+		log.Info().Msg("empty payload")
 	}
 
 	err := w.SetResponse(codes.Empty, message.TextPlain, nil)

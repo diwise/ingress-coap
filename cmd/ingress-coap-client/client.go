@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	co, err := udp.Dial("127.0.0.1:5683")
+	co, err := udp.Dial("coap.diwise.io:5683")
 
 	if err != nil {
 		log.Fatal().Err(err).Msg("error dialing to server")
