@@ -3,6 +3,7 @@ module github.com/diwise/ingress-coap
 go 1.17
 
 require (
+	github.com/matryer/is v1.4.0
 	github.com/plgd-dev/go-coap/v2 v2.4.0
 	github.com/rs/zerolog v1.25.0
 )
