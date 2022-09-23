@@ -62,6 +62,9 @@ func main() {
 	r.Handle("/hello", mux.HandlerFunc(handleHello))
 
 	port := "5683"
+
+	log.Info().Msgf("starting udp listener on port %s", port)
+
 	err := coap.ListenAndServe("udp", ":"+port, r)
 	if err != nil {
 		log.Fatal().Str("port", port).Err(err).Msg(

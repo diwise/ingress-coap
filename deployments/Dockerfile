@@ -13,13 +13,16 @@ COPY . .
 #RUN go test -v ./...
 
 WORKDIR /app/cmd/ingress-coap
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
 
+WORKDIR /app/cmd/ingress-coap-client
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
 
 FROM registry.access.redhat.com/ubi8/ubi-minimal
 WORKDIR /opt/diwise
 
 COPY --from=builder --chown=1001 /app/cmd/ingress-coap/ingress-coap /opt/diwise
+COPY --from=builder --chown=1001 /app/cmd/ingress-coap-client/ingress-coap-client /opt/diwise
 
 RUN chown 1001 /opt/diwise
 RUN chmod 700 /opt/diwise
