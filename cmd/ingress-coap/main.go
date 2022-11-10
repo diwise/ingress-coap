@@ -18,7 +18,7 @@ func loggingMiddleware(next mux.Handler) mux.Handler {
 	return mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
 		// Ignore bots that scan for RFC 6690 endpoints
 		path, err := r.Message.Options.Path()
-		if err == nil && path == ".well-known/core" {
+		if err == nil && (path == ".well-known/core" || path == "/.well-known/core") {
 			return
 		}
 
@@ -88,7 +88,7 @@ func decodePayload(payload []byte) {
 		hex = hex + fmt.Sprintf("%.2X", b)
 	}
 
-	log.Info().Msgf("received payload: %s (%d bytes)", hex, payloadSize)
+	log.Debug().Msgf("received payload: %s (%d bytes)", hex, payloadSize)
 
 	if payloadSize < 160 {
 		log.Error().Msg("payload size is too small to contain a valid packet")
@@ -113,7 +113,8 @@ func decodePayload(payload []byte) {
 	}
 
 	idNumber := binary.LittleEndian.Uint32(payload[5:9])
-	log.Info().Msgf("id number %d", idNumber)
+	idString := fmt.Sprintf("%08x", idNumber)
+	log.Info().Msgf("id number %s", idString)
 
 	if binary.LittleEndian.Uint16(payload[146:150]) != TelegramEndOfMeterDataToken {
 		log.Error().Msg("end of meter data token not found in expected position")
@@ -122,15 +123,37 @@ func decodePayload(payload []byte) {
 
 	timeStamp := binary.LittleEndian.Uint32(payload[9:13])
 	currentTime := time.Unix(int64(timeStamp), 0).UTC()
-	log.Info().Msgf("current timestamp is %s", currentTime.Format(time.RFC3339))
+	totalVolume := binary.LittleEndian.Uint32(payload[14:18])
+	log.Info().Msgf("total volume: %d litres @ %s", totalVolume, currentTime.Format(time.RFC3339))
 
 	timeStamp = binary.LittleEndian.Uint32(payload[26:30])
 	lastMonthReferenceTime := time.Unix(int64(timeStamp), 0).UTC()
-	log.Info().Msgf("last month reference volume timestamp is %s", lastMonthReferenceTime.Format(time.RFC3339))
+	lastMonthVolume := binary.LittleEndian.Uint32(payload[30:34])
+	log.Info().Msgf("last month ref volume was %d @ %s", lastMonthVolume, lastMonthReferenceTime.Format(time.RFC3339))
+
+	flowRate := binary.LittleEndian.Uint32(payload[34:38])
+	log.Info().Msgf("current flow rate %d litres / hour", flowRate)
+
+	waterTemp := binary.LittleEndian.Uint32(payload[38:42])
+	log.Info().Msgf("current water temp is %d C", waterTemp)
 
 	timeStamp = binary.LittleEndian.Uint32(payload[44:48])
 	oldestReferenceTime := time.Unix(int64(timeStamp), 0).UTC()
-	log.Info().Msgf("oldest reference volume timestamp is %s", oldestReferenceTime.Format(time.RFC3339))
+	oldestVolume := binary.LittleEndian.Uint32(payload[48:52])
+	log.Info().Msgf("oldest reference volume is %d from %s", oldestVolume, oldestReferenceTime.Format(time.RFC3339))
+
+	deltaIndex := 52
+	deltaVolume := binary.LittleEndian.Uint16(payload[deltaIndex : deltaIndex+2])
+	var accDeltaVolume uint16 = 0
+
+	for deltaVolume != TelegramEndOfMeterDataToken {
+		accDeltaVolume += deltaVolume
+
+		deltaIndex += 2
+		deltaVolume = binary.LittleEndian.Uint16(payload[deltaIndex : deltaIndex+2])
+	}
+
+	log.Info().Msgf("accumulated delta values: %d", accDeltaVolume)
 
 	batteryLevel := uint32(payload[telegramSize-3])
 	if batteryLevel <= 100 {
