@@ -8,29 +8,35 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/plgd-dev/go-coap/v2"
-	"github.com/plgd-dev/go-coap/v2/message"
-	"github.com/plgd-dev/go-coap/v2/message/codes"
-	"github.com/plgd-dev/go-coap/v2/mux"
+	"github.com/plgd-dev/go-coap/v3"
+	"github.com/plgd-dev/go-coap/v3/message"
+	"github.com/plgd-dev/go-coap/v3/message/codes"
+	"github.com/plgd-dev/go-coap/v3/mux"
 )
 
 func loggingMiddleware(next mux.Handler) mux.Handler {
 	return mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
 		// Ignore bots that scan for RFC 6690 endpoints
-		path, err := r.Message.Options.Path()
+		path, err := r.Message.Options().Path()
 		if err == nil && (path == ".well-known/core" || path == "/.well-known/core") {
 			return
 		}
 
-		log.Info().Msgf("client address %v, %v", w.Client().RemoteAddr(), r.String())
+		log.Info().Msgf("client address %v, %v", w.Conn().RemoteAddr(), r.String())
 		next.ServeCOAP(w, r)
 	})
 }
 
 func handleCoAP(w mux.ResponseWriter, req *mux.Message) {
-	if req.Body != nil {
+	bodySize, err := req.BodySize()
+	if err != nil {
+		log.Error().Err(err).Msg("failed to get body size")
+		return
+	}
+
+	if bodySize > 0 {
 		var body []byte = make([]uint8, 256)
-		n, err := req.Body.Read(body)
+		n, err := req.Body().Read(body)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to read message body")
 			return
@@ -42,7 +48,7 @@ func handleCoAP(w mux.ResponseWriter, req *mux.Message) {
 		log.Info().Msg("empty payload")
 	}
 
-	err := w.SetResponse(codes.Empty, message.TextPlain, nil)
+	err = w.SetResponse(codes.Empty, message.TextPlain, nil)
 	if err != nil {
 		log.Error().Err(err).Msg("unable to set response")
 	}
