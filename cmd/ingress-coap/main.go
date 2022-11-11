@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,7 +15,15 @@ import (
 	"github.com/plgd-dev/go-coap/v3/net"
 	"github.com/plgd-dev/go-coap/v3/options"
 	"github.com/plgd-dev/go-coap/v3/udp"
+	"github.com/plgd-dev/go-coap/v3/udp/coder"
 )
+
+func errorHandler(err error) {
+	// filter out truncated message errors
+	if !errors.Is(err, coder.ErrMessageTruncated) {
+		log.Error().Err(err).Msg("coap error")
+	}
+}
 
 func loggingMiddleware(next mux.Handler) mux.Handler {
 	return mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
@@ -82,9 +91,7 @@ func main() {
 		l.Close()
 	}()
 
-	s := udp.NewServer(options.WithMux(r), options.WithErrors(func(err error) {
-		log.Error().Err(err).Msg("ouch")
-	}))
+	s := udp.NewServer(options.WithMux(r), options.WithErrors(errorHandler))
 
 	err = s.Serve(l)
 	if err != nil {
