@@ -8,10 +8,12 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/plgd-dev/go-coap/v3"
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 	"github.com/plgd-dev/go-coap/v3/mux"
+	"github.com/plgd-dev/go-coap/v3/net"
+	"github.com/plgd-dev/go-coap/v3/options"
+	"github.com/plgd-dev/go-coap/v3/udp"
 )
 
 func loggingMiddleware(next mux.Handler) mux.Handler {
@@ -71,7 +73,20 @@ func main() {
 
 	log.Info().Msgf("starting udp listener on port %s", port)
 
-	err := coap.ListenAndServe("udp", ":"+port, r)
+	l, err := net.NewListenUDP("udp", ":"+port)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create udp listener")
+	}
+
+	defer func() {
+		l.Close()
+	}()
+
+	s := udp.NewServer(options.WithMux(r), options.WithErrors(func(err error) {
+		log.Error().Err(err).Msg("ouch")
+	}))
+
+	err = s.Serve(l)
 	if err != nil {
 		log.Fatal().Str("port", port).Err(err).Msg(
 			"failed to start listening for incoming coap data",
