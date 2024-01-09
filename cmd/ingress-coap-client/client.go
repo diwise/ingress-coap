@@ -6,10 +6,10 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"log/slog"
+	"os"
 	"strconv"
 	"time"
-
-	"github.com/rs/zerolog/log"
 
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/udp"
@@ -18,21 +18,37 @@ import (
 var coapHost string
 var coapTimeout string
 
+var logLevel = new(slog.LevelVar)
+
 func main() {
 
 	flag.StringVar(&coapHost, "host", "", "Hostname or IP to the COAP server")
 	flag.StringVar(&coapTimeout, "timeout", "5", "Timeout in seconds")
 	flag.Parse()
 
+	logLevel.Set(slog.LevelDebug)
+
+	logger := slog.New(
+		slog.NewJSONHandler(
+			os.Stdout,
+			&slog.HandlerOptions{Level: logLevel},
+		),
+	).With(
+		slog.String("service", "ingress-coap"),
+		slog.String("version", "v0.0.1"),
+	)
+
 	timeout, err := strconv.ParseUint(coapTimeout, 10, 64)
 	if err != nil {
-		log.Fatal().Err(err).Msg("invalid timeout value")
+		logger.Error("invalid timeout value", "err", err.Error())
+		os.Exit(-1)
 	}
 
 	co, err := udp.Dial(fmt.Sprintf("%s:5683", coapHost))
 
 	if err != nil {
-		log.Fatal().Err(err).Msg("error dialing to server")
+		logger.Error("error dialing to server", "err", err.Error())
+		os.Exit(-1)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
@@ -43,9 +59,9 @@ func main() {
 	payload := bytes.NewReader(b)
 	resp, err := co.Post(ctx, "/coap", message.AppOctets, payload)
 	if err != nil {
-		log.Fatal().Err(err).Msg("unable to get a response from coap server")
+		logger.Error("unable to get a response from coap server", "err", err.Error())
 		return
 	}
 
-	log.Info().Msgf("response: %+v", resp)
+	logger.Info(fmt.Sprintf("response: %+v", resp))
 }
