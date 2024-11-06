@@ -2,12 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"time"
+
+	"github.com/diwise/iot-agent/pkg/lwm2m"
+	"github.com/diwise/service-chassis/pkg/infrastructure/env"
 
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
@@ -16,6 +23,8 @@ import (
 	"github.com/plgd-dev/go-coap/v3/options"
 	"github.com/plgd-dev/go-coap/v3/udp"
 	"github.com/plgd-dev/go-coap/v3/udp/coder"
+
+	"golang.org/x/oauth2/clientcredentials"
 )
 
 func errorHandler(logger *slog.Logger) func(error) {
@@ -133,7 +142,9 @@ const (
 	TelegramEndOfMeterDataToken uint16 = 0xAAAA
 )
 
-func decodePayload(logger *slog.Logger, payload []byte) (err error) {
+func decodePayload(logger *slog.Logger, payload []byte) error {
+	var err error
+
 	hex := fmt.Sprintf("%.2X", payload[0])
 	payloadSize := len(payload)
 
@@ -147,35 +158,56 @@ func decodePayload(logger *slog.Logger, payload []byte) (err error) {
 	if payloadSize < 160 {
 		err = errors.New("payload size is too small to contain a valid packet")
 		logger.Error("decode failed", "err", err.Error())
-		return
+		return err
 	}
 
 	telegramType := binary.LittleEndian.Uint16(payload[0:2])
-	if telegramType == TelegramTypeRegular {
-		return decodeRegularPayload(logger, payload)
-	} else if telegramType == TelegramTypeTwo {
+
+	switch telegramType {
+	case TelegramTypeRegular:
+		obj, err := decodeRegularPayloadLwm2m(logger, payload)
+		if err != nil {
+			logger.Error("decode failed", "err", err.Error())
+			return err
+		}
+
+		err = pushLwm2mObject(context.Background(), logger, obj)
+		if err != nil {
+			logger.Error("failed to push lwm2m object", "err", err.Error())
+			return err
+		}
+
+	case TelegramTypeTwo:
 		return decodeType2Payload(logger, payload)
-	} else {
+	default:
 		err = fmt.Errorf("unknown telegram type %d", telegramType)
 		logger.Error("decode failed", "err", err.Error())
-		return
+		return err
 	}
+
+	return nil
 }
 
-func decodeRegularPayload(logger *slog.Logger, payload []byte) (err error) {
+func decodeType2Payload(logger *slog.Logger, payload []byte) (err error) {
+	return nil
+}
+
+func decodeRegularPayloadLwm2m(logger *slog.Logger, payload []byte) (lwm2m.Lwm2mObject, error) {
+	var err error
+
 	payloadSize := len(payload)
 
 	if payload[2] != TelegramMagicConstant40 {
 		err = fmt.Errorf("expected byte 2 to be %d", TelegramMagicConstant40)
 		logger.Error("decode failed", "err", err.Error())
-		return
+		return nil, err
 	}
 
 	telegramSize := binary.LittleEndian.Uint16(payload[3:5])
 	if telegramSize != uint16(payloadSize) {
 		err = fmt.Errorf("encoded telegram size %d != payload size %d", telegramSize, payloadSize)
 		logger.Error("decode failed", "err", err.Error())
-		return
+		return nil, err
 	}
 
 	idNumber := binary.LittleEndian.Uint32(payload[5:9])
@@ -185,7 +217,7 @@ func decodeRegularPayload(logger *slog.Logger, payload []byte) (err error) {
 	if binary.LittleEndian.Uint16(payload[146:150]) != TelegramEndOfMeterDataToken {
 		err = errors.New("end of meter data token not found in expected position")
 		logger.Error("decode failed", "err", err.Error())
-		return
+		return nil, err
 	}
 
 	timeStamp := binary.LittleEndian.Uint32(payload[9:13])
@@ -229,9 +261,85 @@ func decodeRegularPayload(logger *slog.Logger, payload []byte) (err error) {
 		logger.Error(fmt.Sprintf("battery level has invalid value %d%%", batteryLevel))
 	}
 
-	return
+	fr := float64(flowRate) / 1000
+
+	wm := lwm2m.NewWaterMeter(idString, float64(totalVolume)/1000, currentTime)
+	wm.MinimumFlowRate = &fr
+	wm.MaximumFlowRate = &fr
+
+	return wm, err
 }
 
-func decodeType2Payload(logger *slog.Logger, payload []byte) (err error) {
+func pushLwm2mObject(ctx context.Context, logger *slog.Logger, obj lwm2m.Lwm2mObject) error {
+	var err error
+
+	agentURL := env.GetVariableOrDefault(ctx, "AGENT_URL", "")
+	if agentURL == "" {
+		logger.Info("no agent url specified, skipping push")
+		return nil
+	}
+
+	tokenURL := env.GetVariableOrDefault(ctx, "OAUTH2_TOKEN_URL", "")
+	clientID := env.GetVariableOrDefault(ctx, "OAUTH2_CLIENT_ID", "")
+	clientSecret := env.GetVariableOrDefault(ctx, "OAUTH2_CLIENT_SECRET", "")
+
+	var oauthConfig *clientcredentials.Config
+
+	if tokenURL == "" || clientID == "" || clientSecret == "" {
+		oauthConfig = &clientcredentials.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			TokenURL:     tokenURL,
+		}
+	}
+
+	url := agentURL + "/api/v0/messages/lwm2m"
+
+	body, err := json.Marshal(obj)
+	if err != nil {
+		err = fmt.Errorf("failed to marshal lwm2m object: %w", err)
+		return err
+	}
+
+	reader := bytes.NewReader(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reader)
+	if err != nil {
+		err = fmt.Errorf("failed to create http request: %w", err)
+		return err
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	if oauthConfig == nil {
+		token, err := oauthConfig.Token(ctx)
+		if err != nil {
+			err = fmt.Errorf("failed to get client credentials from %s: %w", oauthConfig.TokenURL, err)
+			return err
+		}
+
+		req.Header.Add("Authorization", "Bearer "+token.AccessToken)
+	}
+
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		err = fmt.Errorf("failed to create device: %w", err)
+		return err
+	}
+	defer req.Body.Close()
+	io.Copy(io.Discard, req.Body)
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		err = fmt.Errorf("request failed, not authorized")
+		return err
+	}
+
+	if resp.StatusCode != http.StatusCreated {
+		err = fmt.Errorf("request failed with status code %d", resp.StatusCode)
+		return err
+	}
+
 	return nil
 }
