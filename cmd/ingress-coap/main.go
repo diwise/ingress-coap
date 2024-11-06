@@ -15,6 +15,7 @@ import (
 
 	"github.com/diwise/iot-agent/pkg/lwm2m"
 	"github.com/diwise/service-chassis/pkg/infrastructure/env"
+	"github.com/diwise/service-chassis/pkg/infrastructure/o11y/logging"
 
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
@@ -53,9 +54,13 @@ func loggingMiddleware(logger *slog.Logger) func(mux.Handler) mux.Handler {
 
 func handleCoAP(logger *slog.Logger) func(mux.ResponseWriter, *mux.Message) {
 	return func(w mux.ResponseWriter, req *mux.Message) {
+
+		log := logger.With("message_id", req.MessageID())
+		ctx := logging.NewContextWithLogger(req.Context(), log)
+
 		bodySize, err := req.BodySize()
 		if err != nil {
-			logger.Error("failed to get body size", "err", err.Error())
+			log.Error("failed to get body size", "err", err.Error())
 			return
 		}
 
@@ -63,19 +68,23 @@ func handleCoAP(logger *slog.Logger) func(mux.ResponseWriter, *mux.Message) {
 			var body []byte = make([]uint8, 256)
 			n, err := req.Body().Read(body)
 			if err != nil {
-				logger.Error("failed to read message body", "err", err.Error())
+				log.Error("failed to read message body", "err", err.Error())
 				return
 			}
 
-			decodePayload(logger, body[0:n])
+			err = decodePayload(ctx, body[0:n])
+			if err != nil {
+				log.Error("failed to decode payload", "err", err.Error())
+				return
+			}
 
 		} else {
-			logger.Info("empty payload")
+			log.Info("empty payload")
 		}
 
 		err = w.SetResponse(codes.Empty, message.TextPlain, nil)
 		if err != nil {
-			logger.Error("unable to set response", "err", err.Error())
+			log.Error("unable to set response", "err", err.Error())
 		}
 	}
 }
@@ -142,7 +151,7 @@ const (
 	TelegramEndOfMeterDataToken uint16 = 0xAAAA
 )
 
-func decodePayload(logger *slog.Logger, payload []byte) error {
+func decodePayload(ctx context.Context, payload []byte) error {
 	var err error
 
 	hex := fmt.Sprintf("%.2X", payload[0])
@@ -153,6 +162,7 @@ func decodePayload(logger *slog.Logger, payload []byte) error {
 		hex = hex + fmt.Sprintf("%.2X", b)
 	}
 
+	logger := logging.GetFromContext(ctx)
 	logger.Debug("received payload", "hex", hex, "bytecount", payloadSize)
 
 	if payloadSize < 160 {
@@ -165,20 +175,20 @@ func decodePayload(logger *slog.Logger, payload []byte) error {
 
 	switch telegramType {
 	case TelegramTypeRegular:
-		obj, err := decodeRegularPayloadLwm2m(logger, payload)
+		obj, err := decodeRegularPayloadLwm2m(ctx, payload)
 		if err != nil {
 			logger.Error("decode failed", "err", err.Error())
 			return err
 		}
 
-		err = pushLwm2mObject(context.Background(), logger, obj)
+		err = pushLwm2mObject(ctx, obj)
 		if err != nil {
 			logger.Error("failed to push lwm2m object", "err", err.Error())
 			return err
 		}
 
 	case TelegramTypeTwo:
-		return decodeType2Payload(logger, payload)
+		return decodeType2Payload(ctx, payload)
 	default:
 		err = fmt.Errorf("unknown telegram type %d", telegramType)
 		logger.Error("decode failed", "err", err.Error())
@@ -188,12 +198,13 @@ func decodePayload(logger *slog.Logger, payload []byte) error {
 	return nil
 }
 
-func decodeType2Payload(logger *slog.Logger, payload []byte) (err error) {
+func decodeType2Payload(ctx context.Context, payload []byte) (err error) {
 	return nil
 }
 
-func decodeRegularPayloadLwm2m(logger *slog.Logger, payload []byte) (lwm2m.Lwm2mObject, error) {
+func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2mObject, error) {
 	var err error
+	logger := logging.GetFromContext(ctx)
 
 	payloadSize := len(payload)
 
@@ -270,12 +281,14 @@ func decodeRegularPayloadLwm2m(logger *slog.Logger, payload []byte) (lwm2m.Lwm2m
 	return wm, err
 }
 
-func pushLwm2mObject(ctx context.Context, logger *slog.Logger, obj lwm2m.Lwm2mObject) error {
+func pushLwm2mObject(ctx context.Context, obj lwm2m.Lwm2mObject) error {
 	var err error
+
+	logger := logging.GetFromContext(ctx)
 
 	agentURL := env.GetVariableOrDefault(ctx, "AGENT_URL", "")
 	if agentURL == "" {
-		logger.Info("no agent url specified, skipping push")
+		logger.Debug("no agent url specified, skipping push")
 		return nil
 	}
 
@@ -285,7 +298,7 @@ func pushLwm2mObject(ctx context.Context, logger *slog.Logger, obj lwm2m.Lwm2mOb
 
 	var oauthConfig *clientcredentials.Config
 
-	if tokenURL == "" || clientID == "" || clientSecret == "" {
+	if tokenURL != "" && clientID != "" && clientSecret != "" {
 		oauthConfig = &clientcredentials.Config{
 			ClientID:     clientID,
 			ClientSecret: clientSecret,
