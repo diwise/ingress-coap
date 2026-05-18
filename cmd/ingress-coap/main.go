@@ -14,8 +14,14 @@ import (
 	"time"
 
 	"github.com/diwise/iot-agent/pkg/lwm2m"
+	"github.com/diwise/service-chassis/pkg/infrastructure/buildinfo"
 	"github.com/diwise/service-chassis/pkg/infrastructure/env"
+	"github.com/diwise/service-chassis/pkg/infrastructure/o11y"
 	"github.com/diwise/service-chassis/pkg/infrastructure/o11y/logging"
+	"github.com/diwise/service-chassis/pkg/infrastructure/o11y/tracing"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
@@ -28,9 +34,13 @@ import (
 	"golang.org/x/oauth2/clientcredentials"
 )
 
+const serviceName string = "ingress-coap"
+
+var tracer = otel.Tracer("iot-things")
+var serviceVersion = buildinfo.SourceVersion()
+
 func errorHandler(logger *slog.Logger) func(error) {
 	return func(err error) {
-		// filter out truncated message errors
 		if !errors.Is(err, coder.ErrMessageTruncated) {
 			logger.Error("coap error", "err", err.Error())
 		}
@@ -40,7 +50,6 @@ func errorHandler(logger *slog.Logger) func(error) {
 func loggingMiddleware(logger *slog.Logger) func(mux.Handler) mux.Handler {
 	return func(next mux.Handler) mux.Handler {
 		return mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
-			// Ignore bots that scan for RFC 6690 endpoints
 			path, err := r.Message.Options().Path()
 			if err == nil && (path == ".well-known/core" || path == "/.well-known/core") {
 				return
@@ -52,11 +61,16 @@ func loggingMiddleware(logger *slog.Logger) func(mux.Handler) mux.Handler {
 	}
 }
 
-func handleCoAP(logger *slog.Logger) func(mux.ResponseWriter, *mux.Message) {
+func handleCoAP(logger *slog.Logger, totalMessagesCounter metric.Int64Counter) func(mux.ResponseWriter, *mux.Message) {
 	return func(w mux.ResponseWriter, req *mux.Message) {
+		var err error
 
-		log := logger.With("message_id", req.MessageID())
-		ctx := logging.NewContextWithLogger(req.Context(), log)
+		ctx, span := tracer.Start(req.Context(), "handle-coap-request")
+		defer func() { tracing.RecordAnyErrorAndEndSpan(err, span) }()
+
+		_, ctx, log := o11y.AddTraceIDToLoggerAndStoreInContext(span, logger, ctx)
+
+		log.Info("received coap request", "message_id", req.MessageID())
 
 		bodySize, err := req.BodySize()
 		if err != nil {
@@ -78,6 +92,9 @@ func handleCoAP(logger *slog.Logger) func(mux.ResponseWriter, *mux.Message) {
 				return
 			}
 
+			if totalMessagesCounter != nil {
+				totalMessagesCounter.Add(ctx, 1)
+			}
 		} else {
 			log.Info("empty payload")
 		}
@@ -110,16 +127,27 @@ func main() {
 		),
 	).With(
 		slog.String("service", "ingress-coap"),
-		slog.String("version", "v0.0.1"),
+		slog.String("version", serviceVersion),
 	)
+
+	_, logger, cleanup := o11y.Init(context.Background(), serviceName, serviceVersion, "json")
+	defer cleanup()
+
+	totalMessagesCounter, err := otel.Meter("ingress-coap").Int64Counter(
+		"diwise.ingress_coap.messages.total",
+		metric.WithUnit("1"),
+		metric.WithDescription("Total number of received COAP messages"),
+	)
+	if err != nil {
+		logger.Error("failed to create counter", "err", err.Error())
+	}
 
 	r := mux.NewRouter()
 	r.Use(loggingMiddleware(logger))
-	r.Handle("/coap", mux.HandlerFunc(handleCoAP(logger)))
+	r.Handle("/coap", mux.HandlerFunc(handleCoAP(logger, totalMessagesCounter)))
 	r.Handle("/hello", mux.HandlerFunc(handleHello(logger)))
 
 	port := "5683"
-
 	logger.Info("starting udp listener", "port", port)
 
 	l, err := net.NewListenUDP("udp", ":"+port)
@@ -127,20 +155,17 @@ func main() {
 		logger.Error("failed to create udp listener", "err", err.Error())
 		os.Exit(-1)
 	}
+	defer l.Close()
 
-	defer func() {
-		l.Close()
-	}()
+	s := udp.NewServer(
+		options.WithMux(r),
+		options.WithErrors(errorHandler(logger)),
+	)
 
-	s := udp.NewServer(options.WithMux(r), options.WithErrors(errorHandler(logger)))
-
-	err = s.Serve(l)
-	if err != nil {
-		logger.Error(
-			"failed to start listening for incoming coap data",
-			"port", port,
-			"err", err.Error(),
-		)
+	logger.Info("server listening", "port", port)
+	if err := s.Serve(l); err != nil {
+		logger.Error("failed to start listening", "err", err.Error())
+		os.Exit(-1)
 	}
 }
 
@@ -154,6 +179,11 @@ const (
 func decodePayload(ctx context.Context, payload []byte) error {
 	var err error
 
+	ctx, span := tracer.Start(ctx, "decode-payload")
+	defer func() { tracing.RecordAnyErrorAndEndSpan(err, span) }()
+
+	logger := logging.GetFromContext(ctx)
+
 	hex := fmt.Sprintf("%.2X", payload[0])
 	payloadSize := len(payload)
 
@@ -162,7 +192,6 @@ func decodePayload(ctx context.Context, payload []byte) error {
 		hex = hex + fmt.Sprintf("%.2X", b)
 	}
 
-	logger := logging.GetFromContext(ctx)
 	logger.Debug("received payload", "hex", hex, "bytecount", payloadSize)
 
 	if payloadSize < 160 {
@@ -204,6 +233,10 @@ func decodeType2Payload(ctx context.Context, payload []byte) (err error) {
 
 func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2mObject, error) {
 	var err error
+
+	ctx, span := tracer.Start(ctx, "decode-regular-payload-lwm2m")
+	defer func() { tracing.RecordAnyErrorAndEndSpan(err, span) }()
+
 	logger := logging.GetFromContext(ctx)
 
 	payloadSize := len(payload)
@@ -225,6 +258,8 @@ func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2m
 	idString := fmt.Sprintf("%08x", idNumber)
 	logger.Info(fmt.Sprintf("id number %s", idString))
 
+	span.SetAttributes(attribute.String("device_id", idString))
+
 	if binary.LittleEndian.Uint16(payload[146:150]) != TelegramEndOfMeterDataToken {
 		err = errors.New("end of meter data token not found in expected position")
 		logger.Error("decode failed", "err", err.Error())
@@ -236,6 +271,11 @@ func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2m
 	totalVolume := binary.LittleEndian.Uint32(payload[14:18])
 	logger.Info(fmt.Sprintf("total volume: %d litres @ %s", totalVolume, currentTime.Format(time.RFC3339)))
 
+	span.SetAttributes(
+		attribute.Int64("total_volume_litres", int64(totalVolume)),
+		attribute.String("current_time", currentTime.Format(time.RFC3339)),
+	)
+
 	timeStamp = binary.LittleEndian.Uint32(payload[26:30])
 	lastMonthReferenceTime := time.Unix(int64(timeStamp), 0).UTC()
 	lastMonthVolume := binary.LittleEndian.Uint32(payload[30:34])
@@ -246,6 +286,11 @@ func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2m
 
 	waterTemp := binary.LittleEndian.Uint32(payload[38:42])
 	logger.Info(fmt.Sprintf("current water temp is %0.1f C", float32(waterTemp)/100.0))
+
+	span.SetAttributes(
+		attribute.Float64("flow_rate_lph", float64(flowRate)),
+		attribute.Float64("water_temp_c", float64(float32(waterTemp)/100.0)),
+	)
 
 	timeStamp = binary.LittleEndian.Uint32(payload[44:48])
 	oldestReferenceTime := time.Unix(int64(timeStamp), 0).UTC()
@@ -268,6 +313,7 @@ func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2m
 	batteryLevel := uint32(payload[telegramSize-3])
 	if batteryLevel <= 100 {
 		logger.Info(fmt.Sprintf("battery level is %d%%", batteryLevel))
+		span.SetAttributes(attribute.Int64("battery_level_percent", int64(batteryLevel)))
 	} else {
 		logger.Error(fmt.Sprintf("battery level has invalid value %d%%", batteryLevel))
 	}
@@ -284,13 +330,19 @@ func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2m
 func pushLwm2mObject(ctx context.Context, obj lwm2m.Lwm2mObject) error {
 	var err error
 
+	ctx, span := tracer.Start(ctx, "push-lwm2m-object")
+	defer func() { tracing.RecordAnyErrorAndEndSpan(err, span) }()
+
 	logger := logging.GetFromContext(ctx)
 
 	agentURL := env.GetVariableOrDefault(ctx, "AGENT_URL", "")
 	if agentURL == "" {
 		logger.Debug("no agent url specified, skipping push")
+		span.AddEvent("skip_push_no_agent_url")
 		return nil
 	}
+
+	span.SetAttributes(attribute.String("agent_url", agentURL))
 
 	tokenURL := env.GetVariableOrDefault(ctx, "OAUTH2_TOKEN_URL", "")
 	clientID := env.GetVariableOrDefault(ctx, "OAUTH2_CLIENT_ID", "")
@@ -311,6 +363,7 @@ func pushLwm2mObject(ctx context.Context, obj lwm2m.Lwm2mObject) error {
 	body, err := json.Marshal(obj)
 	if err != nil {
 		err = fmt.Errorf("failed to marshal lwm2m object: %w", err)
+		logger.Error("marshal failed", "err", err.Error())
 		return err
 	}
 
@@ -318,14 +371,16 @@ func pushLwm2mObject(ctx context.Context, obj lwm2m.Lwm2mObject) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reader)
 	if err != nil {
 		err = fmt.Errorf("failed to create http request: %w", err)
+		logger.Error("request creation failed", "err", err.Error())
 		return err
 	}
 	req.Header.Add("Content-Type", "application/json")
 
-	if oauthConfig == nil {
+	if oauthConfig != nil {
 		token, err := oauthConfig.Token(ctx)
 		if err != nil {
 			err = fmt.Errorf("failed to get client credentials from %s: %w", oauthConfig.TokenURL, err)
+			logger.Error("auth failed", "err", err.Error())
 			return err
 		}
 
@@ -339,20 +394,28 @@ func pushLwm2mObject(ctx context.Context, obj lwm2m.Lwm2mObject) error {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		err = fmt.Errorf("failed to create device: %w", err)
+		logger.Error("http request failed", "err", err.Error())
 		return err
 	}
-	defer req.Body.Close()
-	io.Copy(io.Discard, req.Body)
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	span.SetAttributes(attribute.Int("http_status_code", resp.StatusCode))
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		err = fmt.Errorf("request failed, not authorized")
+		logger.Error("unauthorized")
 		return err
 	}
 
 	if resp.StatusCode != http.StatusCreated {
 		err = fmt.Errorf("request failed with status code %d", resp.StatusCode)
+		logger.Error("push failed", "status_code", resp.StatusCode)
 		return err
 	}
+
+	logger.Info("successfully pushed to agent")
+	span.AddEvent("push_successful")
 
 	return nil
 }

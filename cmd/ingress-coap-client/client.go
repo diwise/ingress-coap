@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/diwise/service-chassis/pkg/infrastructure/buildinfo"
+
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/udp"
 )
@@ -19,6 +21,7 @@ var coapHost string
 var coapTimeout string
 
 var logLevel = new(slog.LevelVar)
+var serviceVersion = buildinfo.SourceVersion()
 
 func main() {
 
@@ -35,7 +38,7 @@ func main() {
 		),
 	).With(
 		slog.String("service", "ingress-coap"),
-		slog.String("version", "v0.0.1"),
+		slog.String("version", serviceVersion),
 	)
 
 	timeout, err := strconv.ParseUint(coapTimeout, 10, 64)
