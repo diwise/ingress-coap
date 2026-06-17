@@ -36,7 +36,7 @@ import (
 
 const serviceName string = "ingress-coap"
 
-var tracer = otel.Tracer("iot-things")
+var tracer = otel.Tracer(serviceName)
 var serviceVersion = buildinfo.SourceVersion()
 
 func errorHandler(logger *slog.Logger) func(error) {
@@ -86,10 +86,20 @@ func handleCoAP(logger *slog.Logger, totalMessagesCounter metric.Int64Counter) f
 				return
 			}
 
-			err = decodePayload(ctx, body[0:n])
+			obj, err := decodePayload(ctx, body[0:n])
 			if err != nil {
 				log.Error("failed to decode payload", "err", err.Error())
 				return
+			}
+
+			//Check if ID from decoded payload exists in device management /device/{id}. Then push the decoded object to the agent.
+
+			if obj != nil {
+				err = pushLwm2mObject(ctx, obj)
+				if err != nil {
+					log.Error("failed to push lwm2m object", "err", err.Error())
+					return
+				}
 			}
 
 			if totalMessagesCounter != nil {
@@ -176,8 +186,9 @@ const (
 	TelegramEndOfMeterDataToken uint16 = 0xAAAA
 )
 
-func decodePayload(ctx context.Context, payload []byte) error {
+func decodePayload(ctx context.Context, payload []byte) (lwm2m.Lwm2mObject, error) {
 	var err error
+	var obj lwm2m.Lwm2mObject
 
 	ctx, span := tracer.Start(ctx, "decode-payload")
 	defer func() { tracing.RecordAnyErrorAndEndSpan(err, span) }()
@@ -197,39 +208,41 @@ func decodePayload(ctx context.Context, payload []byte) error {
 	if payloadSize < 160 {
 		err = errors.New("payload size is too small to contain a valid packet")
 		logger.Error("decode failed", "err", err.Error())
-		return err
+		return nil, err
 	}
 
 	telegramType := binary.LittleEndian.Uint16(payload[0:2])
 
 	switch telegramType {
 	case TelegramTypeRegular:
-		obj, err := decodeRegularPayloadLwm2m(ctx, payload)
+		obj, err = decodeRegularPayloadLwm2m(ctx, payload)
 		if err != nil {
 			logger.Error("decode failed", "err", err.Error())
-			return err
-		}
-
-		err = pushLwm2mObject(ctx, obj)
-		if err != nil {
-			logger.Error("failed to push lwm2m object", "err", err.Error())
-			return err
+			return nil, err
 		}
 
 	case TelegramTypeTwo:
-		return decodeType2Payload(ctx, payload)
+		err = decodeType2Payload(ctx, payload)
+		if err != nil {
+			logger.Error("decode type2 failed", "err", err.Error())
+			return nil, err
+		}
+		return nil, nil
+
 	default:
 		err = fmt.Errorf("unknown telegram type %d", telegramType)
 		logger.Error("decode failed", "err", err.Error())
-		return err
+		return nil, err
 	}
 
-	return nil
+	return obj, nil
 }
 
 func decodeType2Payload(ctx context.Context, payload []byte) (err error) {
 	return nil
 }
+
+const invalidReading uint32 = 0xFFFFD8F0
 
 func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2mObject, error) {
 	var err error
@@ -268,7 +281,18 @@ func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2m
 
 	timeStamp := binary.LittleEndian.Uint32(payload[9:13])
 	currentTime := time.Unix(int64(timeStamp), 0).UTC()
+	if currentTime.IsZero() {
+		err = errors.New("invalid timestamp in payload")
+		logger.Error("decode failed", "err", err.Error())
+		return nil, err
+	}
+
 	totalVolume := binary.LittleEndian.Uint32(payload[14:18])
+	if totalVolume == 0 {
+		err = errors.New("total volume reading is zero, likely an invalid reading")
+		logger.Error("decode failed", "err", err.Error())
+		return nil, err
+	}
 	logger.Info(fmt.Sprintf("total volume: %d litres @ %s", totalVolume, currentTime.Format(time.RFC3339)))
 
 	span.SetAttributes(
@@ -282,10 +306,18 @@ func decodeRegularPayloadLwm2m(ctx context.Context, payload []byte) (lwm2m.Lwm2m
 	logger.Info(fmt.Sprintf("last month ref volume was %d @ %s", lastMonthVolume, lastMonthReferenceTime.Format(time.RFC3339)))
 
 	flowRate := binary.LittleEndian.Uint32(payload[34:38])
-	logger.Info(fmt.Sprintf("current flow rate %d litres / hour", flowRate))
+	if flowRate == invalidReading {
+		logger.Warn("flow rate reading is empty or invalid")
+	} else {
+		logger.Info(fmt.Sprintf("current flow rate %d litres / hour", flowRate))
+	}
 
 	waterTemp := binary.LittleEndian.Uint32(payload[38:42])
-	logger.Info(fmt.Sprintf("current water temp is %0.1f C", float32(waterTemp)/100.0))
+	if waterTemp >= 0xFFFF0000 {
+		logger.Warn("water temperature reading is empty or invalid", "raw_value", waterTemp)
+	} else {
+		logger.Info(fmt.Sprintf("current water temp is %0.1f C", float32(waterTemp)/100.0))
+	}
 
 	span.SetAttributes(
 		attribute.Float64("flow_rate_lph", float64(flowRate)),
